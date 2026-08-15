@@ -35,4 +35,12 @@ MAX_CHALLENGES = int(os.environ.get("AGENCY_MAX_CHALLENGES", "2"))
 # Generated code runs on this machine. Bound it.
 TEST_TIMEOUT = int(os.environ.get("AGENCY_TEST_TIMEOUT", "120"))
 
+# Set by --review. When false the human gates are pass-throughs and the run is
+# unattended, which is what CI and batch runs want.
+INTERACTIVE = os.environ.get("AGENCY_INTERACTIVE", "").lower() in {"1", "true", "yes"}
+
+# Extra coder passes granted when a human asks for changes at the delivery
+# gate, so a request is not refused by an already-spent automatic budget.
+HUMAN_BUDGET_BONUS = int(os.environ.get("AGENCY_HUMAN_BUDGET_BONUS", "2"))
+
 RUNS_DIR = Path(os.environ.get("AGENCY_RUNS_DIR", REPO_ROOT / "runs"))

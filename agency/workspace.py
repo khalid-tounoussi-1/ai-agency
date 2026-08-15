@@ -3,6 +3,7 @@
 Nodes never touch the filesystem directly -- they hand a relative path and
 content to a Workspace, which refuses anything that would escape the run root.
 """
+import ast
 from pathlib import Path
 
 
@@ -39,8 +40,28 @@ class Workspace:
         return self.resolve(rel).exists()
 
     def list_files(self) -> list[str]:
+        skip = {"__pycache__", ".git", ".venv", ".agency"}
         return sorted(
             str(p.relative_to(self.root))
             for p in self.root.rglob("*")
-            if p.is_file() and "__pycache__" not in p.parts
+            if p.is_file() and not skip & set(p.parts)
         )
+
+    def manifest(self) -> dict[str, list[str]]:
+        """Every Python file already here, with its top-level names. Compact
+        enough to put in a prompt, which a full listing of contents is not."""
+        found: dict[str, list[str]] = {}
+        for rel in self.list_files():
+            if not rel.endswith(".py"):
+                continue
+            try:
+                tree = ast.parse(self.read(rel))
+            except (SyntaxError, UnicodeDecodeError):
+                found[rel] = []
+                continue
+            found[rel] = [
+                node.name
+                for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            ]
+        return found

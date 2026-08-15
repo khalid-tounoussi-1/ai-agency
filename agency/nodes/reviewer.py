@@ -73,7 +73,18 @@ def reviewer_node(state: AgencyState) -> dict[str, Any]:
     )
     test_listing = f"\n--- {plan['test_file']} ---\n{files.get(plan['test_file'], '')}\n"
 
-    if report.get("ok"):
+    human = (state.get("delivery_feedback") or "").strip()
+
+    if human:
+        situation = (
+            f"The suite passes, but the human who commissioned this work "
+            f"rejected the delivery and asked for a change:\n\n{human}\n\n"
+            "Their request is authoritative -- do not argue with it, do not "
+            "judge whether it is necessary. Return REVISE and translate it "
+            "into concrete per-file instructions the Coder can apply. Leave "
+            "\"counterexample\" null."
+        )
+    elif report.get("ok"):
         situation = (
             f"All {report.get('passed', 0)} tests PASSED.\n\n"
             "Your job now is to decide whether this implementation genuinely "
@@ -104,7 +115,7 @@ def reviewer_node(state: AgencyState) -> dict[str, Any]:
         f"Test runner output:\n{report.get('output', '')}\n"
         f"{test_listing}{listing}\n"
         f"{SCHEMA}"
-        f"{COUNTEREXAMPLE_RULE if report.get('ok') else ''}"
+        f"{COUNTEREXAMPLE_RULE if report.get('ok') and not human else ''}"
     )
 
     review = llm.ask_json("reviewer", SYSTEM, user, validate=_validate)
@@ -112,9 +123,9 @@ def reviewer_node(state: AgencyState) -> dict[str, Any]:
     verdict = str(review.get("verdict", "REVISE")).upper()
     defective = bool(review.get("test_file_defective"))
 
-    # Enforcement, not persuasion: a red suite cannot be approved, whatever the
-    # model returned.
-    if not report.get("ok"):
+    # Enforcement, not persuasion: a red suite cannot be approved, and neither
+    # can a delivery a human has just rejected -- whatever the model returned.
+    if not report.get("ok") or human:
         verdict = "REVISE"
 
     # The Coder never receives the test file. Anything outside the plan's source
@@ -141,14 +152,17 @@ def reviewer_node(state: AgencyState) -> dict[str, Any]:
         "files_to_fix": fixes,
         "test_file_defective": defective,
         "defect_reason": str(review.get("defect_reason", "")),
-        "counterexample": counter,
+        "counterexample": None if human else counter,
+        "human_directed": bool(human),
     }
     return {
         "review": resolved,
+        "delivery_feedback": "",  # consumed
         "events": [
             {
                 "node": "reviewer",
                 "verdict": verdict,
+                "human_directed": bool(human),
                 "test_file_defective": defective,
                 "files_to_fix": [f["path"] for f in fixes],
                 "diagnosis": resolved["diagnosis"],

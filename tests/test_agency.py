@@ -7,7 +7,7 @@ No Ollama call happens in this file.
 """
 import pytest
 
-from agency import config, llm
+from agency import config, llm, testgen
 from agency.graph import supervisor_node
 from agency.nodes.challenger import _vet, challenger_node
 # Imported as a module: pytest collects anything named test*, and importing
@@ -277,3 +277,254 @@ def test_collection_failure_routes_to_replan():
         }
     )
     assert out["decision"] == "replan"
+
+
+class TestHumanGates:
+    """The gates suspend the graph with interrupt() and resume with the answer.
+    Exercised through a real one-node graph, so the interrupt/resume mechanism
+    itself is under test -- no model is involved."""
+
+    PLAN = {
+        "summary": "a thing",
+        "files": [{"path": "mod.py", "purpose": "the thing"}],
+        "test_file": "tests/test_mod.py",
+        "acceptance_tests": [{"name": "test_a", "asserts": "f() == 1"}],
+        "notes": "",
+    }
+
+    @staticmethod
+    def _mini(node):
+        from langgraph.checkpoint.memory import InMemorySaver
+        from langgraph.graph import END, START, StateGraph
+
+        from agency.state import AgencyState
+
+        graph = StateGraph(AgencyState)
+        graph.add_node("gate", node)
+        graph.add_edge(START, "gate")
+        graph.add_edge("gate", END)
+        return graph.compile(checkpointer=InMemorySaver())
+
+    @staticmethod
+    def _pending(app, cfg):
+        snapshot = app.get_state(cfg)
+        return [i for task in snapshot.tasks for i in task.interrupts]
+
+    def test_gates_are_passthrough_when_not_interactive(self, monkeypatch):
+        from agency.nodes.gate import delivery_gate_node, plan_gate_node
+
+        monkeypatch.setattr(config, "INTERACTIVE", False)
+        assert plan_gate_node({"plan": self.PLAN})["gate_decision"] == "approve"
+        assert delivery_gate_node({"plan": self.PLAN})["gate_decision"] == "accept"
+
+    def test_plan_gate_suspends_and_resumes_on_approval(self, monkeypatch):
+        from langgraph.types import Command
+
+        from agency.nodes.gate import plan_gate_node
+
+        monkeypatch.setattr(config, "INTERACTIVE", True)
+        app = self._mini(plan_gate_node)
+        cfg = {"configurable": {"thread_id": "approve"}}
+
+        app.invoke({"plan": self.PLAN}, config=cfg)
+        pending = self._pending(app, cfg)
+        assert pending, "the graph should have suspended at the gate"
+        assert pending[0].value["gate"] == "plan"
+        assert pending[0].value["acceptance_tests"] == self.PLAN["acceptance_tests"]
+
+        final = app.invoke(Command(resume={"action": "approve"}), config=cfg)
+        assert final["gate_decision"] == "approve"
+
+    def test_rejecting_the_plan_carries_your_notes_back(self, monkeypatch):
+        from langgraph.types import Command
+
+        from agency.nodes.gate import plan_gate_node
+
+        monkeypatch.setattr(config, "INTERACTIVE", True)
+        app = self._mini(plan_gate_node)
+        cfg = {"configurable": {"thread_id": "reject"}}
+        app.invoke({"plan": self.PLAN}, config=cfg)
+        final = app.invoke(
+            Command(resume={"action": "revise", "feedback": "also handle empty input"}),
+            config=cfg,
+        )
+        assert final["gate_decision"] == "revise"
+        assert final["plan_feedback"] == "also handle empty input"
+
+    def test_rejection_without_notes_is_not_a_rejection(self, monkeypatch):
+        """Nothing to act on, so it must not loop the planner on no information."""
+        from langgraph.types import Command
+
+        from agency.nodes.gate import plan_gate_node
+
+        monkeypatch.setattr(config, "INTERACTIVE", True)
+        app = self._mini(plan_gate_node)
+        cfg = {"configurable": {"thread_id": "empty"}}
+        app.invoke({"plan": self.PLAN}, config=cfg)
+        final = app.invoke(Command(resume={"action": "revise", "feedback": "  "}), config=cfg)
+        assert final["gate_decision"] == "approve"
+
+    def test_requesting_changes_grants_extra_budget(self, monkeypatch):
+        from langgraph.types import Command
+
+        from agency.nodes.gate import delivery_gate_node
+
+        monkeypatch.setattr(config, "INTERACTIVE", True)
+        app = self._mini(delivery_gate_node)
+        cfg = {"configurable": {"thread_id": "changes"}}
+        app.invoke(
+            {"plan": self.PLAN, "test_report": GREEN, "outcome": "success", "files": {}},
+            config=cfg,
+        )
+        final = app.invoke(
+            Command(resume={"action": "changes", "feedback": "rename it"}), config=cfg
+        )
+        assert final["delivery_feedback"] == "rename it"
+        assert final["budget_bonus"] == config.HUMAN_BUDGET_BONUS
+        assert final["outcome"] == "", "asking for changes must undo the success verdict"
+
+
+class TestHumanDirectedRepair:
+    def test_human_request_routes_to_repair_without_a_counterexample(self):
+        out = supervisor_node(
+            {
+                "test_report": GREEN,
+                "review": review(human_directed=True),
+                "iteration": 1,
+            }
+        )
+        assert out["decision"] == "repair"
+
+    def test_human_request_survives_an_exhausted_budget(self):
+        out = supervisor_node(
+            {
+                "test_report": RED,
+                "review": review(),
+                "iteration": config.MAX_ITERATIONS,
+                "budget_bonus": 2,
+            }
+        )
+        assert out["decision"] == "repair"
+
+
+class TestTestGeneration:
+    """The test file is rendered from the plan, never written freehand. These
+    lock down the failure that motivated it: the Planner emitting English
+    ("x raises ValueError") where Python was required, producing a frozen test
+    file that could not compile and could not be repaired."""
+
+    def test_english_instead_of_an_expression_is_rejected(self):
+        with pytest.raises(ValueError, match="does not compile"):
+            testgen.validate_case(
+                {"name": "test_x", "asserts": "r.add_student('') raises ValueError"}
+            )
+
+    def test_exception_cases_use_the_raises_form(self):
+        case = {
+            "name": "test_rejects_blank_id",
+            "setup": ["r = StudentRegistry()"],
+            "raises": "ValueError",
+            "call": "r.add_student('', 'Ada', 9, 'a@x.org')",
+        }
+        testgen.validate_case(case)
+        source = testgen.function_source(case)
+        assert "with pytest.raises(ValueError):" in source
+        compile(source, "<t>", "exec")
+
+    def test_setup_statements_precede_the_assertion(self):
+        case = {
+            "name": "test_counts",
+            "setup": ["r = StudentRegistry()", "r.add_student('s1', 'Ada', 9, 'a@x.org')"],
+            "asserts": "r.count_active() == 1",
+        }
+        testgen.validate_case(case)
+        source = testgen.function_source(case)
+        assert source.splitlines()[1:] == [
+            "    r = StudentRegistry()",
+            "    r.add_student('s1', 'Ada', 9, 'a@x.org')",
+            "    assert r.count_active() == 1",
+        ]
+
+    def test_both_forms_at_once_is_rejected(self):
+        with pytest.raises(ValueError, match="exactly one"):
+            testgen.validate_case(
+                {"name": "test_x", "asserts": "f() == 1", "raises": "ValueError", "call": "f()"}
+            )
+
+    def test_neither_form_is_rejected(self):
+        with pytest.raises(ValueError, match="exactly one"):
+            testgen.validate_case({"name": "test_x", "setup": ["a = 1"]})
+
+    def test_raises_without_call_is_rejected(self):
+        with pytest.raises(ValueError, match="needs .call."):
+            testgen.validate_case({"name": "test_x", "raises": "ValueError"})
+
+    def test_broken_setup_statement_is_caught(self):
+        with pytest.raises(ValueError, match="does not compile"):
+            testgen.validate_case({"name": "test_x", "setup": ["r = ("], "asserts": "r == 1"})
+
+    def test_imports_must_be_imports(self):
+        with pytest.raises(ValueError, match="only import statements"):
+            testgen.validate_imports(["x = 1"])
+        testgen.validate_imports(["from mod import thing", "import json"])
+
+    def test_a_rendered_file_always_compiles(self):
+        plan = {
+            "test_imports": ["from student_registry import StudentRegistry"],
+            "acceptance_tests": [
+                {"name": "test_a", "setup": ["r = StudentRegistry()"], "asserts": "r.count_active() == 0"},
+                {"name": "test_b", "setup": ["r = StudentRegistry()"], "raises": "ValueError", "call": "r.add_student('', 'A', 9, 'a@x.org')"},
+            ],
+        }
+        rendered = testgen.render(plan)
+        compile(rendered, "tests/test_x.py", "exec")
+        assert "import pytest" in rendered
+        assert "from student_registry import StudentRegistry" in rendered
+        assert rendered.count("def test_") == 2
+
+
+class TestProjectAwareness:
+    def test_manifest_reports_top_level_names(self, tmp_path):
+        ws = Workspace(tmp_path)
+        ws.write("mod.py", "import json\n\nclass Thing:\n    pass\n\ndef helper():\n    pass\n")
+        ws.write("notes.txt", "ignored")
+        assert ws.manifest() == {"mod.py": ["Thing", "helper"]}
+
+    def test_manifest_skips_vendored_and_vcs_directories(self, tmp_path):
+        ws = Workspace(tmp_path)
+        ws.write("mod.py", "def a():\n    pass\n")
+        ws.write(".git/hooks/thing.py", "def nope():\n    pass\n")
+        ws.write("__pycache__/cached.py", "def nope():\n    pass\n")
+        assert list(ws.manifest()) == ["mod.py"]
+
+    def test_unparseable_file_does_not_break_the_manifest(self, tmp_path):
+        ws = Workspace(tmp_path)
+        ws.write("broken.py", "def oops(:\n")
+        assert ws.manifest() == {"broken.py": []}
+
+
+def test_a_broken_test_file_routes_to_replan_not_repair():
+    """The Coder cannot edit the test file, so repairing source would loop."""
+    out = supervisor_node(
+        {
+            "test_report": {"ok": False, "stage": "syntax", "syntax_file": "tests/test_x.py"},
+            "plan": {"test_file": "tests/test_x.py"},
+            "review": review(),
+            "iteration": 1,
+            "replans": 0,
+        }
+    )
+    assert out["decision"] == "replan"
+
+
+def test_a_broken_source_file_still_routes_to_repair():
+    out = supervisor_node(
+        {
+            "test_report": {"ok": False, "stage": "syntax", "syntax_file": "mod.py"},
+            "plan": {"test_file": "tests/test_x.py"},
+            "review": review(),
+            "iteration": 1,
+            "replans": 0,
+        }
+    )
+    assert out["decision"] == "repair"

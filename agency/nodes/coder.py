@@ -1,10 +1,11 @@
-"""Coder -- writes the test file first, then implements against it.
+"""Coder -- implements against a test file it did not write and cannot change.
 
 Two modes:
 
-  build   (first pass, or after a replan) writes the pytest file from the
-          plan's acceptance tests, then every source file, giving each one the
-          frozen test file as its contract.
+  build   (first pass, or after a replan) renders the pytest file from the
+          plan's acceptance tests -- mechanically, no model call, see
+          testgen -- then writes every source file with that frozen file as
+          its contract.
   repair  (later passes) rewrites only the files the Reviewer named, using the
           real pytest output as evidence. It is never given the option to edit
           the test file -- see the Reviewer for how a genuinely bad test gets
@@ -13,7 +14,7 @@ Two modes:
 from pathlib import Path
 from typing import Any
 
-from .. import llm
+from .. import llm, testgen
 from ..state import AgencyState
 from ..workspace import Workspace
 
@@ -33,24 +34,9 @@ def _plan_context(plan: dict[str, Any]) -> str:
     )
 
 
-def _write_test_file(state: AgencyState, ws: Workspace, plan: dict[str, Any]) -> str:
-    cases = "\n".join(
-        f"  {a['name']}:\n    assert {a['asserts']}" for a in plan["acceptance_tests"]
-    )
-    user = (
-        f"TASK:\n{state['task']}\n\n"
-        f"{_plan_context(plan)}\n"
-        f"You are writing exactly one file: {plan['test_file']}\n\n"
-        f"Implement EXACTLY these acceptance tests as pytest functions, one "
-        f"function per entry, using the given assertion verbatim where it is "
-        f"valid Python:\n{cases}\n\n"
-        "Import the functions under test from the source files listed above "
-        "(they do not exist yet -- you are defining the contract they must "
-        "meet). Do not weaken, skip, or wrap any assertion in a try block. "
-        "Do not add mocks. Do not add tests beyond the list.\n\n"
-        f"Reply with the raw contents of {plan['test_file']}."
-    )
-    content = llm.strip_code_fences(llm.ask_text("coder", SYSTEM, user))
+def _write_test_file(ws: Workspace, plan: dict[str, Any]) -> str:
+    """Rendered from the plan, not written by the model. See testgen."""
+    content = testgen.render(plan)
     ws.write(plan["test_file"], content)
     return content
 
@@ -68,11 +54,22 @@ def _write_source_file(
         for path, content in written.items()
         if path != spec["path"]
     )
+    # Working inside an existing project: this file may already exist, in which
+    # case the task is to update it rather than replace it wholesale.
+    current = ""
+    if ws.exists(spec["path"]):
+        current = (
+            f"\nThis file ALREADY EXISTS with the contents below. Update it: keep "
+            f"everything that still works and is used elsewhere, and do not drop "
+            f"functions the task did not ask you to remove.\n"
+            f"--- {spec['path']} (current) ---\n{ws.read(spec['path'])}\n"
+        )
     user = (
         f"TASK:\n{state['task']}\n\n"
         f"{_plan_context(plan)}\n"
         f"You are writing exactly one file: {spec['path']}\n"
-        f"Its purpose: {spec.get('purpose', '')}\n\n"
+        f"Its purpose: {spec.get('purpose', '')}\n"
+        f"{current}\n"
         f"This test file is frozen and must pass unchanged. Match its imports "
         f"and its API exactly:\n--- {plan['test_file']} ---\n{test_source}\n"
         f"{siblings}\n"
@@ -122,7 +119,7 @@ def coder_node(state: AgencyState) -> dict[str, Any]:
     if not files or not repairs:
         mode = "build"
         files = {}
-        test_source = _write_test_file(state, ws, plan)
+        test_source = _write_test_file(ws, plan)
         files[plan["test_file"]] = test_source
         for spec in plan["files"]:
             files[spec["path"]] = _write_source_file(state, ws, plan, spec, test_source, files)

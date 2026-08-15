@@ -60,6 +60,12 @@ class AgencyState(TypedDict, total=False):
     test_report: TestReport
     review: Review
 
+    # Human gates
+    gate_decision: str  # "approve"/"revise"/"abort" | "accept"/"changes"/"abort"
+    plan_feedback: str  # your notes, consumed by the planner
+    delivery_feedback: str  # your notes, consumed by the reviewer
+    budget_bonus: int  # extra coder passes granted by a human request
+
     # Control
     iteration: int
     replans: int

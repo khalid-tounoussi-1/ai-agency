@@ -29,15 +29,20 @@ def _truncate(text: str) -> str:
     return f"{head}\n...[{len(text) - MAX_OUTPUT_CHARS} chars elided]...\n{tail}"
 
 
-def _syntax_check(root: Path, files: dict[str, str]) -> str | None:
-    """Cheap precise failure before paying for a pytest process."""
+def _syntax_check(files: dict[str, str]) -> tuple[str, str] | None:
+    """Cheap precise failure before paying for a pytest process. Returns the
+    offending path alongside the message -- which file it is in decides where
+    the run goes next."""
     for rel, content in files.items():
         if not rel.endswith(".py"):
             continue
         try:
             compile(content, rel, "exec")
         except SyntaxError as exc:
-            return f"{rel}:{exc.lineno}: {exc.__class__.__name__}: {exc.msg}\n  {(exc.text or '').rstrip()}"
+            return rel, (
+                f"{rel}:{exc.lineno}: {exc.__class__.__name__}: {exc.msg}\n"
+                f"  {(exc.text or '').rstrip()}"
+            )
     return None
 
 
@@ -46,18 +51,20 @@ def tester_node(state: AgencyState) -> dict[str, Any]:
     files = state.get("files") or {}
     test_path = (state.get("plan") or {}).get("test_file", "the test file")
 
-    syntax_error = _syntax_check(root, files)
+    syntax_error = _syntax_check(files)
     if syntax_error:
+        bad_path, message = syntax_error
         report = {
             "ok": False,
             "stage": "syntax",
             "passed": 0,
             "failed": 0,
-            "output": syntax_error,
+            "output": message,
+            "syntax_file": bad_path,
         }
         return {
             "test_report": report,
-            "events": [{"node": "tester", "stage": "syntax", "ok": False}],
+            "events": [{"node": "tester", "stage": "syntax", "ok": False, "file": bad_path}],
         }
 
     # Anchors pytest's rootdir here so the workspace lands on sys.path and
@@ -72,7 +79,9 @@ def tester_node(state: AgencyState) -> dict[str, Any]:
     # generated project, and silently collected zero tests here. `-c` pins both
     # the config and the rootdir to this workspace.
     ini = root / "pytest.ini"
-    ini.write_text("[pytest]\ntestpaths = .\n")
+    if not ini.exists():
+        # Never overwrite one the project already owns.
+        ini.write_text("[pytest]\ntestpaths = .\n")
 
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(root), env.get("PYTHONPATH", "")]))
